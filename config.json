@@ -1,0 +1,19 @@
+{
+  "models": {
+    "lite": "gemini-2.5-flash-lite-preview-06-17",
+    "flash": "gemini-2.5-flash",
+    "pro": "gemini-2.5-pro"
+  },
+  "audio_settings": {
+    "voice_name": "en-US-Neural2-G",
+    "pyaudio_format_constant": 8,
+    "channels": 1,
+    "rate": 16000,
+    "chunk_size": 1024,
+    "pitch_modifier": -4
+  },
+  "tts_limits": {
+    "byte_limit_for_long_audio": 4900
+  },
+  "system_instruction_file": "diane_system_instruction.md"
+}

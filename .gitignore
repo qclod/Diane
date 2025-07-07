@@ -1,0 +1,16 @@
+# .gitignore
+
+# Ignore secret credentials file
+.env
+
+# Ignore Python virtual environment folder
+diane_env/
+
+# Ignore generated log files
+/logs/
+
+# Ignore Python bytecode files and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
