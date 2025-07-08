@@ -1,6 +1,6 @@
 # Diane AI Assistant
 
-A witty, multi-modal AI companion with a custom personality, powered by Gemini 2.5.
+A witty, multi-model AI companion with a custom personality, powered by Gemini 2.5.
 Can function as an everyday assistant, or a stream co-host or something.
 Yes, this is my first project. Let's hear it for vibes!
 
