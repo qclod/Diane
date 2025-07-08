@@ -1,6 +1,7 @@
 # Diane AI Assistant
 
-A witty, multi-model AI companion with a custom personality, powered by Gemini 2.5.
+A witty, multi-model AI companion interface with a custom personality, powered by Gemini 2.5.
+Super easy input: type directly, or speak to Diane even when the window isn't in focus by using handy hotkeys.
 Can function as an everyday assistant, or a stream co-host or something.
 Yes, this is my first project. Let's hear it for vibes!
 
