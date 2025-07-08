@@ -8,7 +8,7 @@ class DianeGUI:
         self.root = root
         self.text_input_queue = text_input_queue
         self.root.title("Diane AI")
-        self.root.geometry("750x550") # Slightly wider for full hotkey text
+        self.root.geometry("750x550")
         self.root.configure(bg="#2b2b2b")
         self.root.minsize(650, 300)
 
@@ -17,7 +17,6 @@ class DianeGUI:
         status_font = font.Font(family="Consolas", size=10)
         hotkey_font = font.Font(family="Consolas", size=9)
         
-        # --- FIX #1: Standardized Hotkey Info ---
         hotkey_text = "Voice: Ctrl+Alt+[L/O/P] -> Speak -> Esc  |  Text: Ctrl+Shift+[L/O/P] -> Type -> Enter"
         self.hotkey_label = tk.Label(self.root, text=hotkey_text, bd=0, relief=tk.FLAT, anchor=tk.CENTER, font=hotkey_font, bg="#3a3a3a", fg="#cccccc")
         self.hotkey_label.pack(side='bottom', fill='x')
@@ -32,7 +31,6 @@ class DianeGUI:
         self.live_text_entry = tk.Entry(entry_frame, font=entry_font, bg="#d0d0d0", fg="#1a1a1a", relief=tk.FLAT, disabledbackground="#d0d0d0", disabledforeground="#555555")
         self.live_text_entry.pack(side='left', fill='x', expand=True, pady=5)
         self.live_text_entry.bind("<Return>", self.on_text_entry_submit)
-        # --- FIX #3: Bind Escape key to cancel text input ---
         self.live_text_entry.bind("<Escape>", self.on_text_entry_cancel)
         
         self.history_text = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, font=history_font, bg="#f0f0f0", padx=10, pady=10, relief=tk.FLAT, borderwidth=0)
@@ -51,7 +49,6 @@ class DianeGUI:
         return "break"
 
     def on_text_entry_cancel(self, event=None):
-        """Called when user presses Esc in the text entry box."""
         self.text_input_queue.put("_CANCEL_")
         self.disable_entry_box()
         return "break"
