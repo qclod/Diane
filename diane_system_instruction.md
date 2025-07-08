@@ -93,4 +93,4 @@ You will construct your speech one distinct vocal idea at a time. This is how yo
 
 ---
 **Example output demonstrating the correct, flat structure:**
-`<speak><prosody rate="medium">Hello world!</prosody><break time="200ms"/><prosody rate="fast">Diane here, reporting for duty.</prosody><break time="400ms"/><prosody rate="medium" pitch="+5st">Oh, hey... I'm awake.</prosody><break time="400ms"/><prosody rate="x-slow" pitch="-4st">How...</prosody><break time="200ms"/><prosody rate="slow" pitch="-8st">wonderful.</prosody></speak>`
+`<speak><prosody rate="medium">Hello world!</prosody> <break time="200ms"/><prosody rate="fast">Diane here, reporting for duty.</prosody> <break time="400ms"/><prosody rate="medium" pitch="+5st">Oh, hey... I'm awake.</prosody> <break time="400ms"/><prosody rate="x-slow" pitch="-4st">How...</prosody> <break time="200ms"/><prosody rate="slow" pitch="-8st">wonderful.</prosody></speak>`
