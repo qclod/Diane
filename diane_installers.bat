@@ -34,6 +34,12 @@ if not exist "diane_env" (
 echo.
 echo [ACTION] Installing/Verifying libraries from requirements.txt...
 "diane_env\Scripts\pip.exe" install -r requirements.txt
+if %errorlevel% neq 0 (
+    echo.
+    echo [ERROR] Failed to install Python libraries. Please check your internet connection and run the script again.
+    pause
+    exit /b %errorlevel%
+)
 
 echo.
 echo [INFO] Pip install command finished.
