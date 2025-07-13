@@ -2,7 +2,6 @@ google-generativeai
 google-cloud-texttospeech
 google-cloud-speech
 pyaudio
-playsound==1.2.2
 keyboard
 python-dotenv
 pywin32
