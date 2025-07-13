@@ -6,7 +6,7 @@
   },
   "audio_settings": {
     "voice_name": "en-US-Neural2-G",
-    "pyaudio_format_constant": 8,
+    "pyaudio_format_constant": "paInt16",
     "channels": 1,
     "rate": 16000,
     "chunk_size": 1024,
