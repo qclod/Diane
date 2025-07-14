@@ -1,4 +1,4 @@
-# diane_script.py (State-Driven Refactor)
+# diane_script.py
 
 import os, sys, json, re, tempfile, threading, time, wave
 import google.generativeai as genai
@@ -124,7 +124,7 @@ def set_application_state(new_state, status_message=None):
         ui_config = {'activations': 'disabled', 'send': 'disabled', 'cancel': 'disabled', 'pause_resume': 'disabled', 'entry_box_enabled': False, 'pause_resume_text': 'Pause/Resume', 'send_text': 'Send', 'send_command': 'send'}
         ui_config['app_state'] = app_state
         if app_state == "idle":
-            ui_config.update({'activations': 'normal', 'cancel': 'normal'})
+            ui_config.update({'activations': 'normal', 'cancel': 'disabled'})
             status_message = status_message or "✅ Ready. Choose an input method."
         elif app_state == "listening":
             ui_config.update({'cancel': 'normal', 'send': 'normal', 'send_text': 'Send', 'send_command': 'stop'})
@@ -229,7 +229,6 @@ def handle_send_request(user_input, from_state):
     threading.Thread(target=_request_and_speak_thread, daemon=True).start()
 
 def _request_and_speak_thread():
-    # FIX #1: Declare `conversation_history` as global to modify it correctly.
     global staged_input, staged_model_key, conversation_history
     
     model_name = config['models'][staged_model_key]
