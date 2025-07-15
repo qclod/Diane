@@ -49,7 +49,6 @@ By QC Gray/qclod and Gemini, for Decoherent Solutions.
 
 ## Future Update Plans
 
--  Streamline tokens sent to the API; currently very wasteful
 -  Add tool use
 -  Add long-term memory
 -  More GUI improvements
