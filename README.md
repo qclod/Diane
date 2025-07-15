@@ -3,6 +3,8 @@
 A state-driven voice and text interface for real-time interaction with Google's Gemini models, featuring global hotkeys and a customizable AI persona.
 By QC Gray/qclod and Gemini, for Decoherent Solutions.
 
+![example screenshot of GUI](GUI_screenshot.png)
+
 ## Core Features
 
 -   Voice & Text input with on-the-fly model selection (Lite, Flash, Pro).
