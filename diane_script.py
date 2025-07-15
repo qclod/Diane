@@ -1,5 +1,3 @@
-# diane_script.py
-
 import os, sys, json, re, tempfile, threading, time, wave
 import google.generativeai as genai
 from google.cloud import texttospeech, speech
@@ -15,7 +13,6 @@ import tkinter as tk
 if sys.platform == "win32":
     import win32api, win32process, win32con
 
-# --- Global State & Threading Primitives ---
 app_state = "idle"
 state_lock = Lock()
 staged_model_key = ""
@@ -23,7 +20,13 @@ cancellation_event = threading.Event()
 stop_listening_event = threading.Event()
 ACTIVE_VOICE_THREAD = None
 
-# --- Helper Functions ---
+master_history = []
+history_lock = Lock()
+model_caches = {}
+cache_source_lens = {}
+MINIMUM_CACHE_TOKENS = 2048
+CACHE_COMPACTION_THRESHOLD = 30
+
 def sanitize_ssml(raw_text):
     cleaned_text = re.sub(r'```xml\s*|```', '', raw_text).strip()
     is_clean = False
@@ -48,7 +51,14 @@ def set_high_priority():
             print("✅ Process priority set to HIGH for Unix-like OS.")
     except Exception as e: print(f"⚠️  Could not set high process priority: {e}")
 
-# --- Dedicated Audio Player Thread ---
+def estimate_token_count(history):
+    count = 0
+    for turn in history:
+        parts = turn.get('parts', [])
+        if isinstance(parts, list):
+            count += len(parts[0].get('text', '')) if parts else 0
+    return count / 4
+
 class AudioPlayer(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="AudioPlayer")
@@ -88,7 +98,6 @@ class AudioPlayer(threading.Thread):
                 if filepath and os.path.exists(filepath): os.remove(filepath)
             except (Empty, OSError): pass
 
-# --- Configuration and Client Setup ---
 def load_configuration():
     print("--- Loading Configuration ---")
     try:
@@ -114,7 +123,6 @@ def setup_clients():
         print(f"❌ FATAL CLIENT SETUP ERROR: {e}")
         return None, None
 
-# --- Core Logic Functions (State Machine) ---
 def set_application_state(new_state, status_message=None):
     global app_state
     with state_lock:
@@ -164,9 +172,9 @@ def _voice_input_thread():
 
 def listen_and_transcribe(speech_client, audio_settings, gui_queue):
     audio_queue = Queue()
-    final_transcript_container = [""] 
+    final_transcript_container = [""]
     pyaudio_format, channels, rate, chunk = audio_settings['audio_format_pyaudio'], audio_settings['channels'], audio_settings['rate'], audio_settings['chunk_size']
-    
+
     def _audio_recorder():
         p = pyaudio.PyAudio()
         stream = p.open(format=pyaudio_format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
@@ -175,14 +183,14 @@ def listen_and_transcribe(speech_client, audio_settings, gui_queue):
             except (IOError, OSError): break
         audio_queue.put(None)
         stream.stop_stream(); stream.close(); p.terminate()
-    
+
     def _stream_transcriber():
         def _audio_generator():
             while True:
                 chunk_data = audio_queue.get()
                 if chunk_data is None: return
                 yield speech.StreamingRecognizeRequest(audio_content=chunk_data)
-        
+
         config_rec = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=rate, language_code="en-US", enable_automatic_punctuation=True)
         streaming_config = speech.StreamingRecognitionConfig(config=config_rec, interim_results=True)
         try:
@@ -204,7 +212,7 @@ def listen_and_transcribe(speech_client, audio_settings, gui_queue):
     transcriber = threading.Thread(target=_stream_transcriber, daemon=True)
     recorder.start(); transcriber.start()
     recorder.join(); transcriber.join()
-    
+
     return final_transcript_container[0].strip()
 
 def handle_start_text(model_key):
@@ -218,37 +226,81 @@ def handle_start_text(model_key):
 def handle_send_request(user_input, from_state):
     global staged_input
     if app_state != from_state: return
-    
+
     if not user_input.strip():
         handle_cancel_action()
         return
-    
+
     staged_input = user_input
     model_name = config['models'].get(staged_model_key, 'Unknown Model')
     set_application_state("processing", f"🧠 Processing with {model_name}...")
     threading.Thread(target=_request_and_speak_thread, daemon=True).start()
 
 def _request_and_speak_thread():
-    global staged_input, staged_model_key, conversation_history
-    
-    model_name = config['models'][staged_model_key]
+    global staged_input, staged_model_key, master_history, model_caches, cache_source_lens
+
     ui_queue.put(("history", f"You: {staged_input}"))
     print(f"\n[You]: {staged_input}")
-    
-    with history_lock:
-        conversation_history.append({'role': 'user', 'parts': [{'text': staged_input}]})
-        raw_ai_response, conversation_history = get_ai_response(model_name, conversation_history, config['system_instruction'])
-    
+
+    try:
+        model_name = config['models'][staged_model_key]
+
+        with history_lock:
+            master_history.append({'role': 'user', 'parts': [{'text': staged_input}]})
+
+            if estimate_token_count(master_history) < MINIMUM_CACHE_TOKENS:
+                print(f"--- BOOTSTRAP MODE (History < {MINIMUM_CACHE_TOKENS} tokens). Sending full history... ---")
+                model = genai.GenerativeModel(model_name=model_name, system_instruction=config['system_instruction'])
+                final_content = master_history
+            
+            else:
+                current_cache = model_caches.get(staged_model_key)
+                last_known_len = cache_source_lens.get(staged_model_key, 0)
+                history_diff = master_history[last_known_len:]
+
+                if current_cache is None or len(history_diff) >= CACHE_COMPACTION_THRESHOLD:
+                    if current_cache is None:
+                        print(f"--- NEW CACHE: Token threshold reached. Creating cache for '{staged_model_key.upper()}'... ---")
+                    else:
+                        print(f"--- CACHE COMPACTION: Diff of {len(history_diff)} exceeds threshold. Rebuilding... ---")
+                        current_cache.delete()
+
+                    current_cache = genai.caching.CachedContent.create(
+                        model=f"models/{model_name}",
+                        system_instruction=config['system_instruction'],
+                        contents=master_history
+                    )
+                    model_caches[staged_model_key] = current_cache
+                    cache_source_lens[staged_model_key] = len(master_history)
+                
+                else:
+                    print(f"--- CATCH-UP MODE: Using stale cache and sending {len(history_diff)} diff turns. ---")
+
+                model = genai.GenerativeModel.from_cached_content(cached_content=current_cache)
+                final_content = history_diff
+            
+            print(f"    -> [{staged_model_key.upper()}] Sending {len(final_content)} turns as context.")
+            response = model.generate_content(final_content)
+            raw_ai_response = response.text
+            
+            master_history.append({'role': 'model', 'parts': [{'text': raw_ai_response}]})
+
+    except Exception as e:
+        print(f"❌ Gemini Error: {e}")
+        raw_ai_response = "<speak>I seem to be having trouble connecting to my brain.</speak>"
+        with history_lock:
+            if master_history and master_history[-1]['role'] == 'user':
+                master_history.pop()
+
     if cancellation_event.is_set(): return
 
     sanitized_ssml = sanitize_ssml(raw_ai_response)
-    clean_display_text = strip_ssml_tags(sanitized_ssml)
     print(f"[Diane]: {sanitized_ssml}")
     log_conversation_turn(config['log_filename'], staged_model_key, staged_input, sanitized_ssml)
-    ui_queue.put(("history", f"Diane: {clean_display_text}"))
-    
+    ui_queue.put(("history", f"Diane: {strip_ssml_tags(sanitized_ssml)}"))
+
     audio_files = create_audio_chunks(sanitized_ssml, clients[0], config)
-    
+
     if cancellation_event.is_set():
         for f in audio_files:
             if os.path.exists(f): os.remove(f)
@@ -263,31 +315,20 @@ def handle_cancel_action():
     print("--- CANCEL ACTION TRIGGERED ---")
     cancellation_event.set()
     stop_listening_event.set()
-    
+
     global ACTIVE_VOICE_THREAD
     if ACTIVE_VOICE_THREAD and ACTIVE_VOICE_THREAD.is_alive():
         print("--- Waiting for voice thread to terminate... ---")
         ACTIVE_VOICE_THREAD.join()
         print("--- Voice thread terminated. ---")
-    
+
     audio_player.stop_and_clear()
-    
+
     global staged_input, staged_model_key
     staged_input = ""
     staged_model_key = ""
-    
-    set_application_state("idle", "❌ Action cancelled.")
 
-def get_ai_response(model_name, history, system_instruction):
-    print(f"🧠 Sending text to {model_name}...")
-    try:
-        model = genai.GenerativeModel(model_name=model_name, system_instruction=system_instruction)
-        response = model.generate_content(history)
-        history.append(response.candidates[0].content)
-        return response.text, history
-    except Exception as e:
-        print(f"❌ Gemini Error: {e}")
-        return "<speak>I seem to be having trouble connecting to my brain.</speak>", history
+    set_application_state("idle", "❌ Action cancelled.")
 
 def create_audio_chunks(sanitized_ssml, tts_client, config):
     byte_limit = config['tts_limits']['byte_limit_for_long_audio']
@@ -333,10 +374,10 @@ def _split_ssml_into_chunks(ssml_text):
                     new_parent_stack[-1].append(new_parent); new_parent_stack.append(new_parent)
                 new_parent_stack[-1].append(last_added); parent_stack = new_parent_stack; parent_stack.append(last_added)
         def traverse_and_build(source_node):
-            nonlocal parent_stack
             if source_node.text and source_node.text.strip():
+                current_parent = parent_stack[-1]
                 for word in source_node.text.split():
-                    current_parent = parent_stack[-1]; original_text = current_parent.text or ""
+                    original_text = current_parent.text or ""
                     current_parent.text = original_text + word + " "; check_and_split()
             for child_node in source_node:
                 new_elem = ET.Element(child_node.tag, child_node.attrib); parent_stack[-1].append(new_elem)
@@ -345,7 +386,7 @@ def _split_ssml_into_chunks(ssml_text):
                 parent_of_current = parent_stack[-2]
                 for word in source_node.tail.split():
                     original_text = parent_of_current.text or ""
-                    current_parent.text = original_text + word + " "; check_and_split()
+                    parent_of_current.text = original_text + word + " "; check_and_split()
         traverse_and_build(source_root)
         return [ET.tostring(chunk, encoding='unicode') for chunk in chunks]
     except ET.ParseError as e:
@@ -354,30 +395,32 @@ def _split_ssml_into_chunks(ssml_text):
         text_chunks = [plain_text[i:i+CHAR_LIMIT] for i in range(0, len(plain_text), CHAR_LIMIT)]
         return [f"<speak>{chunk}</speak>" for chunk in text_chunks if chunk.strip()]
 
-def log_conversation_turn(filename, model_key, user_input, sanitized_ssml):
+def log_conversation_turn(filename, model_key, user_input, raw_ai_response):
     try:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        clean_ai_response = strip_ssml_tags(sanitized_ssml)
-        log_entry = (f"--- [ {timestamp} | Model: {model_key.upper()} ] ---\n"
-                       f"User: {user_input}\n"
-                       f"Diane: {clean_ai_response}\n\n")
+        clean_ai_response = strip_ssml_tags(raw_ai_response)
+        log_entry = (
+            f"--- [ {timestamp} | Model: {model_key.upper()} ] ---\n"
+            f"User: {user_input}\n"
+            f"Diane (Clean): {clean_ai_response}\n"
+            f"Diane (SSML): {raw_ai_response}\n\n"
+        )
         with open(filename, 'a', encoding='utf-8') as f: f.write(log_entry)
         print(f"📝 Logged to '{filename}'")
     except Exception as e: print(f"⚠️ Log Error: {e}")
 
-# --- Main Application Logic ---
 def main_logic(backend_queue, ui_queue_ref):
-    global config, clients, conversation_history, history_lock, audio_player, ui_queue
+    global config, clients, audio_player, ui_queue
     ui_queue = ui_queue_ref; load_dotenv(); set_high_priority()
     config = load_configuration()
     if not config: ui_queue.put(("status", "FATAL: Config error. Check console.")); return
     clients = setup_clients()
     if not all(clients): ui_queue.put(("status", "FATAL: Client setup error. Check console.")); return
+
     os.makedirs("logs", exist_ok=True)
     config['log_filename'] = os.path.join("logs", f"conversation_log_{time.strftime('%Y-%m-%d_%H-%M-%S')}.txt")
-    conversation_history, history_lock = [], Lock()
     audio_player = AudioPlayer(); audio_player.start()
-    
+
     def on_send_hotkey():
         if app_state == 'listening': handle_stop_listening()
         elif app_state == 'awaiting_text': ui_queue.put(('request_gui_input', None))
@@ -389,26 +432,42 @@ def main_logic(backend_queue, ui_queue_ref):
         keyboard.add_hotkey(f'ctrl+alt+{model}', lambda k=key: backend_queue.put(('start_voice', k)))
         keyboard.add_hotkey(f'ctrl+shift+{model}', lambda k=key: backend_queue.put(('start_text', k)))
     print("--- Hotkey listener is active ---")
-    
-    greeting_ssml = """<speak><prosody rate="medium">Hello world!</prosody> <prosody rate="fast">Diane here... reporting for duty!</prosody><break time="400ms"/> <prosody rate="medium" pitch="+5st">Oh, hey... I'm awake.</prosody><break time="400ms"/> <prosody rate="x-slow" pitch="-4st">How...</prosody><break time="200ms"/> <prosody rate="slow" pitch="-8st">wonderful.</prosody></speak>"""
+
+    greeting_ssml = """<speak><prosody rate="medium">Hello world!</prosody> <prosody rate="fast">Diane here...</prosody><break time="400ms"/> <prosody rate="medium" pitch="+5st">Oh, hey... I'm awake.</prosody><break time="400ms"/> <prosody rate="x-slow" pitch="-4st">How...</prosody><break time="200ms"/> <prosody rate="slow" pitch="-8st">wonderful.</prosody></speak>"""
     sanitized_greeting = sanitize_ssml(greeting_ssml)
-    ui_queue.put(("history", f"Diane: {strip_ssml_tags(sanitized_greeting)}"))
+    clean_greeting_text = strip_ssml_tags(sanitized_greeting)
+
+    with history_lock:
+        master_history.append({'role': 'model', 'parts': [{'text': sanitized_greeting}]})
+
+    print(f"\n[Diane]: {sanitized_greeting}")
+    log_conversation_turn(config['log_filename'], "SYSTEM", "[STARTUP]", sanitized_greeting)
+    ui_queue.put(("history", f"Diane: {clean_greeting_text}"))
     audio_files = create_audio_chunks(sanitized_greeting, clients[0], config)
     if audio_files: set_application_state("speaking"); audio_player.play_files(audio_files)
     else: set_application_state("idle")
 
     while True:
-        command, data = backend_queue.get()
-        if command == 'start_voice': handle_start_voice(data)
-        elif command == 'start_text': handle_start_text(data)
-        elif command == 'stop_listening': handle_stop_listening()
-        elif command == 'send_request': handle_send_request(data, "awaiting_text")
-        elif command == 'cancel_action': handle_cancel_action()
-        elif command == 'toggle_pause_audio': audio_player.toggle_pause()
+        try:
+            command, data = backend_queue.get()
+            if command == 'start_voice': handle_start_voice(data)
+            elif command == 'start_text': handle_start_text(data)
+            elif command == 'stop_listening': handle_stop_listening()
+            elif command == 'send_request': handle_send_request(data, "awaiting_text")
+            elif command == 'cancel_action': handle_cancel_action()
+            elif command == 'toggle_pause_audio': audio_player.toggle_pause()
+        except KeyboardInterrupt:
+            print("--- Exiting due to Ctrl+C ---")
+            break
+
 
 if __name__ == '__main__':
     backend_queue, ui_queue = Queue(), Queue()
     root = tk.Tk(); gui = DianeGUI(root, backend_queue, ui_queue)
     logic_thread = threading.Thread(target=main_logic, args=(backend_queue, ui_queue), daemon=True)
     logic_thread.start()
-    root.mainloop()
+
+    try:
+        root.mainloop()
+    finally:
+        print("--- Main window closed. Application shutting down. ---")
