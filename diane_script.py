@@ -1,4 +1,5 @@
-import os, sys, json, re, tempfile, threading, time, wave
+import os, sys, json, re, tempfile, threading, time, wave, html
+from html.parser import HTMLParser
 import google.generativeai as genai
 from google.cloud import texttospeech, speech
 import pyaudio
@@ -16,6 +17,7 @@ if sys.platform == "win32":
 app_state = "idle"
 state_lock = Lock()
 staged_model_key = ""
+staged_input = ""
 cancellation_event = threading.Event()
 stop_listening_event = threading.Event()
 ACTIVE_VOICE_THREAD = None
@@ -26,18 +28,60 @@ model_caches = {}
 cache_source_lens = {}
 MINIMUM_CACHE_TOKENS = 2048
 CACHE_COMPACTION_THRESHOLD = 30
+DIFF_TOKEN_REBUILD_THRESHOLD = 4096
+
+class SSMLFixer(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.result = []
+        self.is_in_prosody = False
+
+    def handle_starttag(self, tag, attrs):
+        attr_str = ''.join([f' {k}="{v}"' for k, v in attrs])
+        if tag == 'prosody':
+            if self.is_in_prosody:
+                self.result.append('</prosody>')
+            self.result.append(f'<prosody{attr_str}>')
+            self.is_in_prosody = True
+        elif tag == 'break':
+            self.result.append(f'<break{attr_str}/>')
+        else:
+            self.result.append(f'<{tag}{attr_str}>')
+
+    def handle_endtag(self, tag):
+        if tag == 'prosody':
+            if self.is_in_prosody:
+                self.result.append('</prosody>')
+                self.is_in_prosody = False
+        elif tag == 'break':
+            pass
+        else:
+            self.result.append(f'</{tag}>')
+
+    def handle_data(self, data):
+        self.result.append(data)
+
+    def get_fixed_ssml(self):
+        if self.is_in_prosody:
+            self.result.append('</prosody>')
+        return "".join(self.result)
 
 def sanitize_ssml(raw_text):
     cleaned_text = re.sub(r'```xml\s*|```', '', raw_text).strip()
-    is_clean = False
-    while not is_clean:
-        original_text = cleaned_text
-        if cleaned_text.startswith('<speak>'): cleaned_text = cleaned_text[len('<speak>'):].lstrip()
-        if cleaned_text.endswith('</speak>'): cleaned_text = cleaned_text[:-len('</speak>')].rstrip()
-        if cleaned_text == original_text: is_clean = True
-    return f"<speak>{cleaned_text}</speak>"
+    cleaned_text = re.sub(r'(")([a-zA-Z]+=)', r'\1 \2', cleaned_text)
+    cleaned_text = cleaned_text.replace('</mods>', '</prosody>')
+    cleaned_text = cleaned_text.replace('</songs>', '</prosody>')
+    cleaned_text = re.sub(r'</?emphasis.*?>', '', cleaned_text)
+    cleaned_text = re.sub(r'&(?![a-zA-Z#0-9]+;)', '&', cleaned_text)
+    content = re.sub(r'</?speak>', '', cleaned_text).strip()
+    fixer = SSMLFixer()
+    fixer.feed(content)
+    fixed_content = fixer.get_fixed_ssml()
+    return f"<speak>{fixed_content}</speak>"
 
-def strip_ssml_tags(sanitized_ssml): return re.sub(r'<[^>]+>', '', sanitized_ssml).strip()
+def strip_ssml_tags(sanitized_ssml):
+    text_without_tags = re.sub(r'<[^>]+>', '', sanitized_ssml)
+    return html.unescape(text_without_tags).strip()
 
 def set_high_priority():
     try:
@@ -49,21 +93,22 @@ def set_high_priority():
         else:
             os.setpriority(os.PRIO_PROCESS, 0, -10)
             print("✅ Process priority set to HIGH for Unix-like OS.")
-    except Exception as e: print(f"⚠️  Could not set high process priority: {e}")
+    except Exception as e:
+        print(f"⚠️  Could not set high process priority: {e}")
 
 def estimate_token_count(history):
     count = 0
     for turn in history:
-        parts = turn.get('parts', [])
-        if isinstance(parts, list):
-            count += len(parts[0].get('text', '')) if parts else 0
+        for part in turn.get('parts', []):
+            count += len(str(part.get('text', '')))
     return count / 4
 
 class AudioPlayer(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="AudioPlayer")
         self.audio_queue = Queue()
-        self.pause_event = threading.Event(); self.pause_event.set()
+        self.pause_event = threading.Event()
+        self.pause_event.set()
         self.stop_playback_event = threading.Event()
         self.current_file = None
     def run(self):
@@ -77,32 +122,48 @@ class AudioPlayer(threading.Thread):
                     stream = p.open(format=p.get_format_from_width(wf.getsampwidth()), channels=wf.getnchannels(), rate=wf.getframerate(), output=True)
                     data = wf.readframes(1024)
                     while data and not self.stop_playback_event.is_set():
-                        self.pause_event.wait(); stream.write(data); data = wf.readframes(1024)
-                    stream.close(); p.terminate()
-                if os.path.exists(self.current_file): os.remove(self.current_file)
+                        self.pause_event.wait()
+                        stream.write(data)
+                        data = wf.readframes(1024)
+                    stream.close()
+                    p.terminate()
+                if os.path.exists(self.current_file):
+                    os.remove(self.current_file)
                 self.current_file = None
-            except Exception as e: print(f"❌ Audio player error: {e}")
+            except Exception as e:
+                print(f"❌ Audio player error: {e}")
             if self.audio_queue.empty() and app_state in ["speaking", "paused"]:
                 set_application_state("idle")
     def play_files(self, file_list):
-        for f in file_list: self.audio_queue.put(f)
+        for f in file_list:
+            self.audio_queue.put(f)
     def toggle_pause(self):
-        if app_state not in ["speaking", "paused"]: return
-        if self.pause_event.is_set(): self.pause_event.clear(); set_application_state("paused")
-        else: self.pause_event.set(); set_application_state("speaking")
+        if app_state not in ["speaking", "paused"]:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            set_application_state("paused")
+        else:
+            self.pause_event.set()
+            set_application_state("speaking")
     def stop_and_clear(self):
-        self.stop_playback_event.set(); self.pause_event.set()
+        self.stop_playback_event.set()
+        self.pause_event.set()
         while not self.audio_queue.empty():
             try:
                 filepath = self.audio_queue.get_nowait()
-                if filepath and os.path.exists(filepath): os.remove(filepath)
-            except (Empty, OSError): pass
+                if filepath and os.path.exists(filepath):
+                    os.remove(filepath)
+            except (Empty, OSError):
+                pass
 
 def load_configuration():
     print("--- Loading Configuration ---")
     try:
-        with open("config.json", 'r', encoding='utf-8') as f: config = json.load(f)
-        with open(config['system_instruction_file'], 'r', encoding='utf-8') as f: config['system_instruction'] = f.read().strip()
+        with open("config.json", 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        with open(config['system_instruction_file'], 'r', encoding='utf-8') as f:
+            config['system_instruction'] = f.read().strip()
         audio_format_val = config['audio_settings']['pyaudio_format_constant']
         if isinstance(audio_format_val, str):
             config['audio_settings']['audio_format_pyaudio'] = getattr(pyaudio, audio_format_val, pyaudio.paInt16)
@@ -126,7 +187,8 @@ def setup_clients():
 def set_application_state(new_state, status_message=None):
     global app_state
     with state_lock:
-        if app_state == new_state: return
+        if app_state == new_state:
+            return
         app_state = new_state
         print(f"--- State changed to: {app_state.upper()} ---")
         ui_config = {'activations': 'disabled', 'send': 'disabled', 'cancel': 'disabled', 'pause_resume': 'disabled', 'entry_box_enabled': False, 'pause_resume_text': 'Pause/Resume', 'send_text': 'Send', 'send_command': 'send'}
@@ -145,13 +207,16 @@ def set_application_state(new_state, status_message=None):
         elif app_state == "paused":
             ui_config.update({'cancel': 'normal', 'pause_resume': 'normal', 'pause_resume_text': 'Resume'})
         ui_queue.put(("ui_state", ui_config))
-        if status_message: ui_queue.put(("status", status_message))
+        if status_message:
+            ui_queue.put(("status", status_message))
 
 def handle_start_voice(model_key):
-    if app_state != "idle": return
+    if app_state != "idle":
+        return
     global staged_model_key, ACTIVE_VOICE_THREAD
     staged_model_key = model_key
-    cancellation_event.clear(); stop_listening_event.clear()
+    cancellation_event.clear()
+    stop_listening_event.clear()
     model_name = config['models'].get(model_key, 'Unknown Model')
     set_application_state("listening", f"🎙️ Listening to {model_name}...")
     ACTIVE_VOICE_THREAD = threading.Thread(target=_voice_input_thread, daemon=True)
@@ -179,16 +244,21 @@ def listen_and_transcribe(speech_client, audio_settings, gui_queue):
         p = pyaudio.PyAudio()
         stream = p.open(format=pyaudio_format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
         while not stop_listening_event.is_set() and not cancellation_event.is_set():
-            try: audio_queue.put(stream.read(chunk, exception_on_overflow=False))
-            except (IOError, OSError): break
+            try:
+                audio_queue.put(stream.read(chunk, exception_on_overflow=False))
+            except (IOError, OSError):
+                break
         audio_queue.put(None)
-        stream.stop_stream(); stream.close(); p.terminate()
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
 
     def _stream_transcriber():
         def _audio_generator():
             while True:
                 chunk_data = audio_queue.get()
-                if chunk_data is None: return
+                if chunk_data is None:
+                    return
                 yield speech.StreamingRecognizeRequest(audio_content=chunk_data)
 
         config_rec = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=rate, language_code="en-US", enable_automatic_punctuation=True)
@@ -197,7 +267,8 @@ def listen_and_transcribe(speech_client, audio_settings, gui_queue):
             responses = speech_client.streaming_recognize(config=streaming_config, requests=_audio_generator())
             finalized_parts = []
             for r in responses:
-                if cancellation_event.is_set() or stop_listening_event.is_set(): break
+                if cancellation_event.is_set() or stop_listening_event.is_set():
+                    break
                 if r.results and r.results[0].alternatives:
                     phrase = r.results[0].alternatives[0].transcript
                     if r.results[0].is_final:
@@ -206,17 +277,21 @@ def listen_and_transcribe(speech_client, audio_settings, gui_queue):
                     gui_queue.put(("update_entry", combined_text))
             final_transcript_container[0] = ' '.join(finalized_parts)
         except Exception as e:
-            if not cancellation_event.is_set(): print(f"⚠️  Speech recognition stream ended: {e}")
+            if not cancellation_event.is_set():
+                print(f"⚠️  Speech recognition stream ended: {e}")
 
     recorder = threading.Thread(target=_audio_recorder, daemon=True)
     transcriber = threading.Thread(target=_stream_transcriber, daemon=True)
-    recorder.start(); transcriber.start()
-    recorder.join(); transcriber.join()
+    recorder.start()
+    transcriber.start()
+    recorder.join()
+    transcriber.join()
 
     return final_transcript_container[0].strip()
 
 def handle_start_text(model_key):
-    if app_state != "idle": return
+    if app_state != "idle":
+        return
     global staged_model_key
     staged_model_key = model_key
     cancellation_event.clear()
@@ -225,7 +300,8 @@ def handle_start_text(model_key):
 
 def handle_send_request(user_input, from_state):
     global staged_input
-    if app_state != from_state: return
+    if app_state != from_state:
+        return
 
     if not user_input.strip():
         handle_cancel_action()
@@ -237,79 +313,121 @@ def handle_send_request(user_input, from_state):
     threading.Thread(target=_request_and_speak_thread, daemon=True).start()
 
 def _request_and_speak_thread():
-    global staged_input, staged_model_key, master_history, model_caches, cache_source_lens
+    local_model_key = staged_model_key
+    local_input = staged_input
 
-    ui_queue.put(("history", f"You: {staged_input}"))
-    print(f"\n[You]: {staged_input}")
+    global master_history, model_caches, cache_source_lens
 
-    try:
-        model_name = config['models'][staged_model_key]
+    ui_queue.put(("history", f"You: {local_input}"))
+    print(f"\n[You]: {local_input}")
 
-        with history_lock:
-            master_history.append({'role': 'user', 'parts': [{'text': staged_input}]})
+    raw_ai_response = ""
+    is_request_successful = False
 
-            if estimate_token_count(master_history) < MINIMUM_CACHE_TOKENS:
-                print(f"--- BOOTSTRAP MODE (History < {MINIMUM_CACHE_TOKENS} tokens). Sending full history... ---")
-                model = genai.GenerativeModel(model_name=model_name, system_instruction=config['system_instruction'])
-                final_content = master_history
+    with history_lock:
+        master_history.append({'role': 'user', 'parts': [{'text': local_input}]})
+
+    while not is_request_successful:
+        if cancellation_event.is_set():
+            return
+
+        try:
+            model_name = config['models'][local_model_key]
             
-            else:
-                current_cache = model_caches.get(staged_model_key)
-                last_known_len = cache_source_lens.get(staged_model_key, 0)
-                history_diff = master_history[last_known_len:]
+            with history_lock:
+                total_tokens = estimate_token_count(master_history)
 
-                if current_cache is None or len(history_diff) >= CACHE_COMPACTION_THRESHOLD:
-                    if current_cache is None:
-                        print(f"--- NEW CACHE: Token threshold reached. Creating cache for '{staged_model_key.upper()}'... ---")
-                    else:
-                        print(f"--- CACHE COMPACTION: Diff of {len(history_diff)} exceeds threshold. Rebuilding... ---")
-                        current_cache.delete()
-
-                    current_cache = genai.caching.CachedContent.create(
-                        model=f"models/{model_name}",
-                        system_instruction=config['system_instruction'],
-                        contents=master_history
-                    )
-                    model_caches[staged_model_key] = current_cache
-                    cache_source_lens[staged_model_key] = len(master_history)
-                
+                if total_tokens < MINIMUM_CACHE_TOKENS:
+                    print(f"--- BOOTSTRAP MODE (History < {MINIMUM_CACHE_TOKENS} tokens). Sending full history... ---")
+                    model = genai.GenerativeModel(model_name=model_name, system_instruction=config['system_instruction'])
+                    final_content = master_history
+                    print(f"    -> [{local_model_key.upper()}] Sending {len(final_content)} turns as context.")
+                    response = model.generate_content(final_content)
+                    raw_ai_response = response.text
                 else:
-                    print(f"--- CATCH-UP MODE: Using stale cache and sending {len(history_diff)} diff turns. ---")
+                    current_cache = model_caches.get(local_model_key)
+                    last_known_len = cache_source_lens.get(local_model_key, 0)
+                    history_diff = master_history[last_known_len:]
+                    
+                    rebuild_reason = None
+                    if current_cache is None:
+                        rebuild_reason = f"NEW CACHE for '{local_model_key.upper()}'"
+                    elif len(history_diff) >= CACHE_COMPACTION_THRESHOLD:
+                        rebuild_reason = f"CACHE COMPACTION: Diff of {len(history_diff)} turns exceeds threshold ({CACHE_COMPACTION_THRESHOLD})"
+                    else:
+                        diff_tokens = estimate_token_count(history_diff)
+                        if diff_tokens >= DIFF_TOKEN_REBUILD_THRESHOLD:
+                            rebuild_reason = f"CACHE COMPACTION: Diff tokens ({int(diff_tokens)}) exceed threshold ({DIFF_TOKEN_REBUILD_THRESHOLD})"
+                    
+                    if rebuild_reason:
+                        print(f"--- BOOTSTRAP/REBUILD MODE: {rebuild_reason}. Rebuilding... ---")
+                        if current_cache:
+                            try:
+                                current_cache.delete()
+                            except Exception as e:
+                                print(f"⚠️  Could not delete old cache (it may have already expired): {e}")
+                        
+                        history_for_caching = master_history[:-1]
+                        current_cache = genai.caching.CachedContent.create(
+                            model=f"models/{model_name}",
+                            system_instruction=config['system_instruction'],
+                            contents=history_for_caching
+                        )
+                        model_caches[local_model_key] = current_cache
+                        cache_source_lens[local_model_key] = len(history_for_caching)
+                    else:
+                        print(f"--- CATCH-UP MODE: Using existing cache and sending {len(history_diff)} diff turns. ---")
+                    
+                    model = genai.GenerativeModel.from_cached_content(cached_content=current_cache)
+                    final_content = master_history[cache_source_lens.get(local_model_key, 0):]
+                    print(f"    -> [{local_model_key.upper()}] Sending {len(final_content)} turns as context.")
+                    response = model.generate_content(final_content)
+                    raw_ai_response = response.text
+                
+                is_request_successful = True
 
-                model = genai.GenerativeModel.from_cached_content(cached_content=current_cache)
-                final_content = history_diff
-            
-            print(f"    -> [{staged_model_key.upper()}] Sending {len(final_content)} turns as context.")
-            response = model.generate_content(final_content)
-            raw_ai_response = response.text
-            
+        except Exception as e:
+            if "CachedContent not found" in str(e):
+                print(f"⚠️  Cache for '{local_model_key}' has expired. Deleting local reference and retrying silently.")
+                if local_model_key in model_caches:
+                    del model_caches[local_model_key]
+                if local_model_key in cache_source_lens:
+                    del cache_source_lens[local_model_key]
+                continue
+            else:
+                print(f"❌ Gemini Error: {e}")
+                raw_ai_response = "<speak>I seem to be having trouble connecting to my brain.</speak>"
+                is_request_successful = True
+
+    with history_lock:
+        if raw_ai_response:
             master_history.append({'role': 'model', 'parts': [{'text': raw_ai_response}]})
-
-    except Exception as e:
-        print(f"❌ Gemini Error: {e}")
-        raw_ai_response = "<speak>I seem to be having trouble connecting to my brain.</speak>"
-        with history_lock:
+        else:
             if master_history and master_history[-1]['role'] == 'user':
                 master_history.pop()
+            return
 
-    if cancellation_event.is_set(): return
+    if cancellation_event.is_set():
+        return
 
     sanitized_ssml = sanitize_ssml(raw_ai_response)
     print(f"[Diane]: {sanitized_ssml}")
-    log_conversation_turn(config['log_filename'], staged_model_key, staged_input, sanitized_ssml)
+    log_conversation_turn(config['log_filename'], local_model_key, local_input, sanitized_ssml)
     ui_queue.put(("history", f"Diane: {strip_ssml_tags(sanitized_ssml)}"))
 
     audio_files = create_audio_chunks(sanitized_ssml, clients[0], config)
 
     if cancellation_event.is_set():
         for f in audio_files:
-            if os.path.exists(f): os.remove(f)
+            if os.path.exists(f):
+                os.remove(f)
         return
 
     if audio_files:
         set_application_state("speaking")
         audio_player.play_files(audio_files)
-    else: set_application_state("idle")
+    else:
+        set_application_state("idle")
 
 def handle_cancel_action():
     print("--- CANCEL ACTION TRIGGERED ---")
@@ -318,9 +436,7 @@ def handle_cancel_action():
 
     global ACTIVE_VOICE_THREAD
     if ACTIVE_VOICE_THREAD and ACTIVE_VOICE_THREAD.is_alive():
-        print("--- Waiting for voice thread to terminate... ---")
         ACTIVE_VOICE_THREAD.join()
-        print("--- Voice thread terminated. ---")
 
     audio_player.stop_and_clear()
 
@@ -332,14 +448,17 @@ def handle_cancel_action():
 
 def create_audio_chunks(sanitized_ssml, tts_client, config):
     byte_limit = config['tts_limits']['byte_limit_for_long_audio']
-    ssml_chunks = [sanitized_ssml]
-    if len(sanitized_ssml.encode('utf-8')) > byte_limit:
-        ssml_chunks = _split_ssml_into_chunks(sanitized_ssml)
+    ssml_chunks = _split_ssml_into_chunks(sanitized_ssml, byte_limit)
+    print(f"--- Split into {len(ssml_chunks)} audio chunks. ---")
+    
     audio_files = []
-    for ssml_chunk in ssml_chunks:
-        if cancellation_event.is_set() or not strip_ssml_tags(ssml_chunk).strip(): continue
+    for i, ssml_chunk in enumerate(ssml_chunks):
+        if cancellation_event.is_set() or not strip_ssml_tags(ssml_chunk).strip():
+            continue
+        print(f"    -> Synthesizing chunk {i+1}/{len(ssml_chunks)} ({len(ssml_chunk.encode('utf-8'))} bytes)...")
         filepath = _synthesize_single_chunk(ssml_chunk, tts_client, config['audio_settings'])
-        if filepath: audio_files.append(filepath)
+        if filepath:
+            audio_files.append(filepath)
     return audio_files
 
 def _synthesize_single_chunk(ssml_text, client, audio_settings):
@@ -355,45 +474,58 @@ def _synthesize_single_chunk(ssml_text, client, audio_settings):
         print(f"❌ TTS Error (chunk): {e}")
         return None
 
-def _split_ssml_into_chunks(ssml_text):
-    BYTE_LIMIT = 4800
+def _split_ssml_into_chunks(ssml_text, byte_limit):
     try:
         source_root = ET.fromstring(ssml_text)
-        chunks, parent_stack = [], [ET.Element(source_root.tag, source_root.attrib)]
-        chunks.append(parent_stack[0])
-        def check_and_split():
-            nonlocal parent_stack
-            if len(ET.tostring(chunks[-1], encoding='utf-8')) > BYTE_LIMIT:
-                last_added, parent_of_last = parent_stack[-1], parent_stack[-2]
-                parent_of_last.remove(last_added)
-                new_chunk_root = ET.Element(source_root.tag, source_root.attrib)
-                chunks.append(new_chunk_root)
-                new_parent_stack = [new_chunk_root]
-                for old_parent in parent_stack[1:-1]:
-                    new_parent = ET.Element(old_parent.tag, old_parent.attrib)
-                    new_parent_stack[-1].append(new_parent); new_parent_stack.append(new_parent)
-                new_parent_stack[-1].append(last_added); parent_stack = new_parent_stack; parent_stack.append(last_added)
-        def traverse_and_build(source_node):
-            if source_node.text and source_node.text.strip():
-                current_parent = parent_stack[-1]
-                for word in source_node.text.split():
-                    original_text = current_parent.text or ""
-                    current_parent.text = original_text + word + " "; check_and_split()
-            for child_node in source_node:
-                new_elem = ET.Element(child_node.tag, child_node.attrib); parent_stack[-1].append(new_elem)
-                parent_stack.append(new_elem); check_and_split(); traverse_and_build(child_node); parent_stack.pop()
-            if source_node.tail and source_node.tail.strip():
-                parent_of_current = parent_stack[-2]
-                for word in source_node.tail.split():
-                    original_text = parent_of_current.text or ""
-                    parent_of_current.text = original_text + word + " "; check_and_split()
-        traverse_and_build(source_root)
-        return [ET.tostring(chunk, encoding='unicode') for chunk in chunks]
+        if len(ssml_text.encode('utf-8')) > byte_limit:
+            print(f"--- SSML is valid and exceeds {byte_limit} bytes. Splitting by structure... ---")
+            return _split_by_structure(source_root, byte_limit)
+        else:
+            print(f"--- SSML is valid and within byte limit. No splitting needed. ---")
+            return [ssml_text]
     except ET.ParseError as e:
-        print(f"❌ SSML Parse Error: {e}. Falling back to plain text splitting.")
-        plain_text = strip_ssml_tags(ssml_text); CHAR_LIMIT = 4500
-        text_chunks = [plain_text[i:i+CHAR_LIMIT] for i in range(0, len(plain_text), CHAR_LIMIT)]
-        return [f"<speak>{chunk}</speak>" for chunk in text_chunks if chunk.strip()]
+        print(f"❌ SSML Parse Error: {e}. Salvaging text and splitting by sentence. ---")
+        plain_text = strip_ssml_tags(ssml_text)
+        return _split_by_sentence(plain_text, byte_limit)
+
+def _split_by_structure(source_root, byte_limit):
+    final_chunks = []
+    current_chunk_root = ET.Element(source_root.tag, source_root.attrib)
+
+    for elem in list(source_root):
+        elem_str = ET.tostring(elem, encoding='unicode')
+        current_chunk_str = ET.tostring(current_chunk_root, encoding='unicode')
+        
+        if len(current_chunk_str.encode('utf-8')) + len(elem_str.encode('utf-8')) > byte_limit and len(list(current_chunk_root)) > 0:
+            final_chunks.append(ET.tostring(current_chunk_root, encoding='unicode'))
+            current_chunk_root = ET.Element(source_root.tag, source_root.attrib)
+        
+        current_chunk_root.append(elem)
+
+    if len(list(current_chunk_root)) > 0:
+        final_chunks.append(ET.tostring(current_chunk_root, encoding='unicode'))
+
+    return final_chunks
+
+def _split_by_sentence(plain_text, byte_limit):
+    chunks = []
+    current_chunk_text = ""
+    sentences = re.split(r'(?<=[.!?])\s+', plain_text)
+    
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+        
+        if len(current_chunk_text.encode('utf-8')) + len(sentence.encode('utf-8')) > byte_limit and current_chunk_text:
+            chunks.append(f"<speak>{current_chunk_text.strip()}</speak>")
+            current_chunk_text = ""
+            
+        current_chunk_text += sentence + " "
+        
+    if current_chunk_text.strip():
+        chunks.append(f"<speak>{current_chunk_text.strip()}</speak>")
+        
+    return chunks
 
 def log_conversation_turn(filename, model_key, user_input, raw_ai_response):
     try:
@@ -405,35 +537,49 @@ def log_conversation_turn(filename, model_key, user_input, raw_ai_response):
             f"Diane (Clean): {clean_ai_response}\n"
             f"Diane (SSML): {raw_ai_response}\n\n"
         )
-        with open(filename, 'a', encoding='utf-8') as f: f.write(log_entry)
+        with open(filename, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
         print(f"📝 Logged to '{filename}'")
-    except Exception as e: print(f"⚠️ Log Error: {e}")
+    except Exception as e:
+        print(f"⚠️ Log Error: {e}")
 
 def main_logic(backend_queue, ui_queue_ref):
     global config, clients, audio_player, ui_queue
-    ui_queue = ui_queue_ref; load_dotenv(); set_high_priority()
+    ui_queue = ui_queue_ref
+    load_dotenv()
+    set_high_priority()
     config = load_configuration()
-    if not config: ui_queue.put(("status", "FATAL: Config error. Check console.")); return
+    if not config:
+        ui_queue.put(("status", "FATAL: Config error. Check console."))
+        return
     clients = setup_clients()
-    if not all(clients): ui_queue.put(("status", "FATAL: Client setup error. Check console.")); return
+    if not all(clients):
+        ui_queue.put(("status", "FATAL: Client setup error. Check console."))
+        return
 
     os.makedirs("logs", exist_ok=True)
     config['log_filename'] = os.path.join("logs", f"conversation_log_{time.strftime('%Y-%m-%d_%H-%M-%S')}.txt")
-    audio_player = AudioPlayer(); audio_player.start()
+    audio_player = AudioPlayer()
+    audio_player.start()
 
     def on_send_hotkey():
-        if app_state == 'listening': handle_stop_listening()
-        elif app_state == 'awaiting_text': ui_queue.put(('request_gui_input', None))
+        if app_state == 'listening':
+            backend_queue.put(('stop_listening', None))
+        elif app_state == 'awaiting_text':
+            ui_queue.put(('request_gui_input', None))
 
-    keyboard.add_hotkey('ctrl+shift+m', on_send_hotkey); keyboard.add_hotkey('ctrl+alt+m', on_send_hotkey)
-    keyboard.add_hotkey('ctrl+shift+k', handle_cancel_action); keyboard.add_hotkey('ctrl+alt+k', handle_cancel_action)
-    keyboard.add_hotkey('ctrl+shift+i', audio_player.toggle_pause); keyboard.add_hotkey('ctrl+alt+i', audio_player.toggle_pause)
-    for model, key in [('l','lite'), ('o','flash'), ('p','pro')]:
+    keyboard.add_hotkey('ctrl+shift+m', on_send_hotkey)
+    keyboard.add_hotkey('ctrl+alt+m', on_send_hotkey)
+    keyboard.add_hotkey('ctrl+shift+k', lambda: backend_queue.put(('cancel_action', None)))
+    keyboard.add_hotkey('ctrl+alt+k', lambda: backend_queue.put(('cancel_action', None)))
+    keyboard.add_hotkey('ctrl+shift+i', lambda: backend_queue.put(('toggle_pause_audio', None)))
+    keyboard.add_hotkey('ctrl+alt+i', lambda: backend_queue.put(('toggle_pause_audio', None)))
+    for model, key in [('l', 'lite'), ('o', 'flash'), ('p', 'pro')]:
         keyboard.add_hotkey(f'ctrl+alt+{model}', lambda k=key: backend_queue.put(('start_voice', k)))
         keyboard.add_hotkey(f'ctrl+shift+{model}', lambda k=key: backend_queue.put(('start_text', k)))
     print("--- Hotkey listener is active ---")
 
-    greeting_ssml = """<speak><prosody rate="medium">Hello world!</prosody> <prosody rate="fast">Diane here...</prosody><break time="400ms"/> <prosody rate="medium" pitch="+5st">Oh, hey... I'm awake.</prosody><break time="400ms"/> <prosody rate="x-slow" pitch="-4st">How...</prosody><break time="200ms"/> <prosody rate="slow" pitch="-8st">wonderful.</prosody></speak>"""
+    greeting_ssml = """<speak>Hello world. <prosody rate="fast">Diane here!</prosody><break time="400ms"/> <prosody pitch="+5st">Oh, hey... I'm awake.</prosody><break time="400ms"/> <prosody rate="x-slow" pitch="-4st">How...</prosody><break time="200ms"/> <prosody rate="slow" pitch="-9st">wonderful.</prosody></speak>"""
     sanitized_greeting = sanitize_ssml(greeting_ssml)
     clean_greeting_text = strip_ssml_tags(sanitized_greeting)
 
@@ -444,26 +590,35 @@ def main_logic(backend_queue, ui_queue_ref):
     log_conversation_turn(config['log_filename'], "SYSTEM", "[STARTUP]", sanitized_greeting)
     ui_queue.put(("history", f"Diane: {clean_greeting_text}"))
     audio_files = create_audio_chunks(sanitized_greeting, clients[0], config)
-    if audio_files: set_application_state("speaking"); audio_player.play_files(audio_files)
-    else: set_application_state("idle")
+    if audio_files:
+        set_application_state("speaking")
+        audio_player.play_files(audio_files)
+    else:
+        set_application_state("idle")
 
     while True:
         try:
             command, data = backend_queue.get()
-            if command == 'start_voice': handle_start_voice(data)
-            elif command == 'start_text': handle_start_text(data)
-            elif command == 'stop_listening': handle_stop_listening()
-            elif command == 'send_request': handle_send_request(data, "awaiting_text")
-            elif command == 'cancel_action': handle_cancel_action()
-            elif command == 'toggle_pause_audio': audio_player.toggle_pause()
+            if command == 'start_voice':
+                handle_start_voice(data)
+            elif command == 'start_text':
+                handle_start_text(data)
+            elif command == 'stop_listening':
+                handle_stop_listening()
+            elif command == 'send_request':
+                handle_send_request(data, "awaiting_text")
+            elif command == 'cancel_action':
+                handle_cancel_action()
+            elif command == 'toggle_pause_audio':
+                audio_player.toggle_pause()
         except KeyboardInterrupt:
             print("--- Exiting due to Ctrl+C ---")
             break
 
-
 if __name__ == '__main__':
     backend_queue, ui_queue = Queue(), Queue()
-    root = tk.Tk(); gui = DianeGUI(root, backend_queue, ui_queue)
+    root = tk.Tk()
+    gui = DianeGUI(root, backend_queue, ui_queue)
     logic_thread = threading.Thread(target=main_logic, args=(backend_queue, ui_queue), daemon=True)
     logic_thread.start()
 
