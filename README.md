@@ -1,7 +1,7 @@
 # Diane
 
 A state-driven voice and text interface for real-time interaction with Google's Gemini models, featuring global hotkeys and a customizable AI persona.
-By QC Gray/qclod and Gemini, for Decoherent Solutions.
+By QC Gray/qclod and Gemini, for [Decoherent Solutions](https://qclod.neocities.org/).
 
 ![example screenshot of GUI](GUI_screenshot.png)
 
